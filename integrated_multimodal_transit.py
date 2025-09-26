@@ -1,6 +1,6 @@
 # integrated_multimodal_transit_tool.py
 # Complete FastAPI app combining OSRM bike routing, Google Transit, GTFS real-time, and shapefile analysis
-# Revised for GitHub data.zip integration and Railway deployment
+# Deployable on Railway with all features integrated
 
 import os
 import json
@@ -13,7 +13,7 @@ import tempfile
 import zipfile
 import io
 from typing import List, Dict, Optional, Tuple, Any
-from fastapi import FastAPI, Query, HTTPException, UploadFile, File, Form
+from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 import uvicorn
@@ -24,7 +24,7 @@ import sys
 
 def install_packages():
     """Install required packages if missing"""
-    packages = ["polyline", "pandas", "geopandas", "shapely", "numpy", "aiofiles"]
+    packages = ["polyline", "pandas", "geopandas", "shapely", "numpy"]
     for package in packages:
         try:
             __import__(package)
@@ -56,10 +56,9 @@ GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
 OSRM_SERVER = os.getenv("OSRM_SERVER", "http://router.project-osrm.org")
 BIKE_SPEED_MPH = float(os.getenv("BIKE_SPEED_MPH", "11"))
 
-# Data configuration - updated for your GitHub repository
-DATA_ZIP_URL = os.getenv("DATA_ZIP_URL", "https://raw.githubusercontent.com/raphaelmrema/Multimodal-tool/main/data.zip")
-ROADS_SHAPEFILE_URL = os.getenv("ROADS_SHAPEFILE_URL", DATA_ZIP_URL)
-TRANSIT_STOPS_SHAPEFILE_URL = os.getenv("TRANSIT_STOPS_SHAPEFILE_URL", DATA_ZIP_URL)
+# Shapefile paths - these can be URLs, S3 paths, or local paths in Railway volume
+ROADS_SHAPEFILE_URL = os.getenv("ROADS_SHAPEFILE_URL", "")
+TRANSIT_STOPS_SHAPEFILE_URL = os.getenv("TRANSIT_STOPS_SHAPEFILE_URL", "")
 
 # GTFS data URLs
 GTFS_URLS = [
@@ -168,6 +167,7 @@ class EnhancedGTFSManager:
     
     def get_realtime_departures(self, stop_id: str) -> List[Dict]:
         """Get simulated real-time departures"""
+        # Simplified version - returns simulated data
         current_time = datetime.datetime.now()
         departures = []
         
@@ -188,55 +188,51 @@ class EnhancedGTFSManager:
         return sorted(departures, key=lambda x: x["realtime_departure"])
 
 # =============================================================================
-# ENHANCED SHAPEFILE ANALYSIS (Updated for GitHub data.zip)
+# SHAPEFILE ANALYSIS (GeoPandas-based)
 # =============================================================================
 
-class CombinedZipShapefileAnalyzer:
-    """Shapefile analyzer that handles combined data.zip from GitHub"""
+class ShapefileAnalyzer:
+    """Analyze bike routes against shapefile data"""
     
     def __init__(self):
         self.roads_gdf = None
         self.transit_stops_gdf = None
         self.loaded = False
-        self.data_zip_url = DATA_ZIP_URL
-        self.temp_dir = None
         
     def load_shapefiles(self):
-        """Load shapefiles from combined data.zip"""
+        """Load shapefiles from URLs or local paths"""
         if not GEOPANDAS_AVAILABLE:
             logger.warning("GeoPandas not available - shapefile analysis disabled")
             return False
             
         try:
-            # Download and extract the combined ZIP
-            zip_path = self._download_data_zip()
-            if not zip_path:
-                logger.warning("Could not download data.zip - continuing without shapefile analysis")
-                return False
+            # Load roads shapefile
+            if ROADS_SHAPEFILE_URL:
+                if ROADS_SHAPEFILE_URL.startswith("http"):
+                    # Download from URL
+                    self.roads_gdf = gpd.read_file(ROADS_SHAPEFILE_URL)
+                elif os.path.exists(ROADS_SHAPEFILE_URL):
+                    # Load from local file
+                    self.roads_gdf = gpd.read_file(ROADS_SHAPEFILE_URL)
+                else:
+                    # Try Railway volume path
+                    volume_path = f"/data/{os.path.basename(ROADS_SHAPEFILE_URL)}"
+                    if os.path.exists(volume_path):
+                        self.roads_gdf = gpd.read_file(volume_path)
+                
+                if self.roads_gdf is not None:
+                    logger.info(f"Loaded roads shapefile: {len(self.roads_gdf)} features")
+                    self._standardize_roads_columns()
             
-            # Extract and load shapefiles
-            extract_dir = self._extract_zip(zip_path)
-            if not extract_dir:
-                return False
-            
-            self.temp_dir = extract_dir
-            
-            # Find and load roads shapefile
-            roads_file = self._find_shapefile(extract_dir, ["roads", "bike", "street", "lane", "cycling", "bicycle"])
-            if roads_file:
-                self.roads_gdf = gpd.read_file(roads_file)
-                logger.info(f"Loaded roads shapefile: {len(self.roads_gdf)} features from {roads_file}")
-                self._standardize_roads_columns()
-            else:
-                logger.warning("No roads shapefile found in data.zip")
-            
-            # Find and load transit stops shapefile
-            stops_file = self._find_shapefile(extract_dir, ["stop", "transit", "bus", "station"])
-            if stops_file:
-                self.transit_stops_gdf = gpd.read_file(stops_file)
-                logger.info(f"Loaded transit stops: {len(self.transit_stops_gdf)} features from {stops_file}")
-            else:
-                logger.warning("No transit stops shapefile found in data.zip")
+            # Load transit stops shapefile
+            if TRANSIT_STOPS_SHAPEFILE_URL:
+                if TRANSIT_STOPS_SHAPEFILE_URL.startswith("http"):
+                    self.transit_stops_gdf = gpd.read_file(TRANSIT_STOPS_SHAPEFILE_URL)
+                elif os.path.exists(TRANSIT_STOPS_SHAPEFILE_URL):
+                    self.transit_stops_gdf = gpd.read_file(TRANSIT_STOPS_SHAPEFILE_URL)
+                
+                if self.transit_stops_gdf is not None:
+                    logger.info(f"Loaded transit stops: {len(self.transit_stops_gdf)} features")
             
             self.loaded = (self.roads_gdf is not None)
             return self.loaded
@@ -245,181 +241,30 @@ class CombinedZipShapefileAnalyzer:
             logger.error(f"Error loading shapefiles: {e}")
             return False
     
-    def _download_data_zip(self):
-        """Download the data.zip file"""
-        urls_to_try = [
-            self.data_zip_url,
-            ROADS_SHAPEFILE_URL,
-            TRANSIT_STOPS_SHAPEFILE_URL
-        ]
-        
-        for url in urls_to_try:
-            if not url or not url.startswith("http"):
-                continue
-                
-            try:
-                logger.info(f"Downloading data from: {url}")
-                
-                headers = {
-                    'User-Agent': 'Mozilla/5.0 (compatible; MultimodalTransitTool/1.0)',
-                    'Accept': 'application/zip, application/octet-stream, */*'
-                }
-                
-                response = requests.get(url, timeout=60, stream=True, headers=headers)
-                response.raise_for_status()
-                
-                # Save to temporary file
-                temp_dir = tempfile.mkdtemp()
-                zip_path = os.path.join(temp_dir, "data.zip")
-                
-                with open(zip_path, 'wb') as f:
-                    for chunk in response.iter_content(chunk_size=8192):
-                        f.write(chunk)
-                
-                file_size = os.path.getsize(zip_path)
-                logger.info(f"Downloaded data.zip ({file_size} bytes)")
-                
-                # Verify it's a valid ZIP file
-                if file_size > 0:
-                    try:
-                        with zipfile.ZipFile(zip_path, 'r') as test_zip:
-                            test_zip.testzip()
-                        return zip_path
-                    except zipfile.BadZipFile:
-                        logger.error(f"Downloaded file is not a valid ZIP: {url}")
-                        continue
-                
-            except Exception as e:
-                logger.error(f"Failed to download from {url}: {e}")
-                continue
-        
-        logger.error("Could not download data.zip from any source")
-        return None
-    
-    def _extract_zip(self, zip_path):
-        """Extract ZIP file and return extraction directory"""
-        try:
-            extract_dir = tempfile.mkdtemp()
-            
-            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-                zip_ref.extractall(extract_dir)
-            
-            logger.info(f"Extracted data.zip to: {extract_dir}")
-            
-            # List contents for debugging
-            file_count = 0
-            for root, dirs, files in os.walk(extract_dir):
-                for file in files:
-                    file_count += 1
-                    if file_count <= 10:  # Show first 10 files
-                        rel_path = os.path.relpath(os.path.join(root, file), extract_dir)
-                        logger.info(f"Found file: {rel_path}")
-            
-            if file_count > 10:
-                logger.info(f"... and {file_count - 10} more files")
-            
-            return extract_dir
-            
-        except Exception as e:
-            logger.error(f"Failed to extract ZIP: {e}")
-            return None
-    
-    def _find_shapefile(self, search_dir, keywords):
-        """Find shapefile based on keywords in filename"""
-        try:
-            shapefiles_found = []
-            
-            # First pass: look for shapefiles with keywords
-            for root, dirs, files in os.walk(search_dir):
-                for file in files:
-                    if file.endswith('.shp'):
-                        file_lower = file.lower()
-                        for keyword in keywords:
-                            if keyword in file_lower:
-                                full_path = os.path.join(root, file)
-                                shapefiles_found.append((full_path, keyword, file))
-                                logger.info(f"Found {keyword} shapefile: {file}")
-            
-            # Return the first keyword match
-            if shapefiles_found:
-                return shapefiles_found[0][0]
-            
-            # Second pass: if no keyword match, return first .shp file found
-            for root, dirs, files in os.walk(search_dir):
-                for file in files:
-                    if file.endswith('.shp'):
-                        full_path = os.path.join(root, file)
-                        logger.info(f"Using first shapefile found: {file}")
-                        return full_path
-            
-            return None
-            
-        except Exception as e:
-            logger.error(f"Error finding shapefile: {e}")
-            return None
-    
     def _standardize_roads_columns(self):
-        """Standardize column names for roads data"""
+        """Standardize column names"""
         if self.roads_gdf is None:
             return
         
-        logger.info(f"Roads shapefile columns: {list(self.roads_gdf.columns)}")
-        
-        # Comprehensive field mappings
+        # Map common field variations
         field_mappings = {
-            'facility_type': [
-                'Facility_Type', 'FACILITY_TYPE', 'facility_type', 'FACILITY_T',
-                'bike_facility', 'BIKE_FACILITY', 'infrastructure', 'INFRASTRUC',
-                'BIKELANE', 'bike_lane', 'BIKE_LANE', 'cycling', 'CYCLING',
-                'facility', 'FACILITY', 'type', 'TYPE', 'class', 'CLASS'
-            ],
-            'bike_score': [
-                'Bike_Score', 'bike_score', 'BIKE_SCORE', 'BikeScore',
-                'safety_score', 'SAFETY_SCORE', 'score', 'SCORE',
-                'rating', 'RATING', 'quality', 'QUALITY', 'index', 'INDEX'
-            ],
-            'speed_limit': [
-                'Speed_Limit', 'SPEED_LIMIT', 'Speed', 'SPD_LIM',
-                'speed', 'SPEED', 'mph', 'MPH', 'SPEEDLIMIT', 'maxspeed', 'MAXSPEED'
-            ],
-            'lanes': [
-                'Lanes', 'LANES', 'Num_Lanes', 'NUM_LANES',
-                'lane_count', 'LANE_COUNT', 'NUMLANES', 'lanes_total', 'LANES_TOTAL'
-            ],
-            'lts': [
-                'LTS', 'lts', 'Level_Traffic_Stress', 'LEVEL_TRAFFIC_STRESS',
-                'traffic_stress', 'TRAFFIC_STRESS', 'stress', 'STRESS'
-            ]
+            'facility_type': ['Facility_Type', 'FACILITY_TYPE', 'facility_type', 'FACILITY_T'],
+            'bike_score': ['Bike_Score', 'bike_score', 'BIKE_SCORE', 'BikeScore'],
+            'speed_limit': ['Speed_Limit', 'SPEED_LIMIT', 'Speed', 'SPD_LIM'],
+            'lanes': ['Lanes', 'LANES', 'Num_Lanes', 'NUM_LANES']
         }
         
-        # Apply mappings
-        mapped_fields = []
         for standard_name, variations in field_mappings.items():
-            mapped = False
             for col in self.roads_gdf.columns:
                 if col in variations:
                     self.roads_gdf[standard_name] = self.roads_gdf[col]
-                    logger.info(f"Mapped {col} -> {standard_name}")
-                    mapped_fields.append(standard_name)
-                    mapped = True
                     break
-            
-            if not mapped:
-                # Set intelligent defaults
+            else:
+                # Set default if not found
                 if standard_name == 'facility_type':
                     self.roads_gdf[standard_name] = 'NO BIKELANE'
-                elif standard_name == 'bike_score':
-                    self.roads_gdf[standard_name] = 50
-                elif standard_name == 'speed_limit':
-                    self.roads_gdf[standard_name] = 30
-                elif standard_name == 'lanes':
-                    self.roads_gdf[standard_name] = 2
-                elif standard_name == 'lts':
-                    self.roads_gdf[standard_name] = 3
-                
-                logger.info(f"Set default for {standard_name}")
-        
-        logger.info(f"Successfully mapped fields: {mapped_fields}")
+                else:
+                    self.roads_gdf[standard_name] = 0
     
     def analyze_route_segments(self, route_geometry):
         """Analyze route segments against shapefile data"""
@@ -435,13 +280,6 @@ class CombinedZipShapefileAnalyzer:
             route_line = LineString(coords)
             route_gdf = gpd.GeoDataFrame([1], geometry=[route_line], crs="EPSG:4326")
             
-            # Ensure both have same CRS
-            if self.roads_gdf.crs != route_gdf.crs:
-                if self.roads_gdf.crs is None:
-                    self.roads_gdf = self.roads_gdf.set_crs("EPSG:4326")
-                else:
-                    route_gdf = route_gdf.to_crs(self.roads_gdf.crs)
-            
             # Buffer route and find intersecting roads
             route_buffer = route_gdf.buffer(0.0002)  # ~20 meters
             intersecting = self.roads_gdf[self.roads_gdf.intersects(route_buffer.iloc[0])]
@@ -456,25 +294,21 @@ class CombinedZipShapefileAnalyzer:
             total_length = 0
             
             for idx, road in intersecting.iterrows():
-                facility_type = str(road.get('facility_type', 'NO BIKELANE')).strip()
+                facility_type = road.get('facility_type', 'NO BIKELANE')
                 bike_score = float(road.get('bike_score', 50))
+                
+                # Calculate LTS
                 speed_limit = float(road.get('speed_limit', 30))
                 lanes = int(road.get('lanes', 2))
-                lts = int(road.get('lts', 3))
+                lts = self._calculate_lts(facility_type, speed_limit, lanes)
                 
-                # Calculate LTS if not provided
-                if lts == 3:  # Default value, try to calculate
-                    lts = self._calculate_lts(facility_type, speed_limit, lanes)
-                
-                # Estimate segment length (convert degrees to miles roughly)
-                segment_length = road.geometry.length * 69  # Very rough conversion
+                # Estimate segment length
+                segment_length = road.geometry.length * 69  # Rough conversion to miles
                 
                 segments.append({
                     "facility_type": facility_type,
                     "bike_score": bike_score,
                     "LTS": lts,
-                    "speed_limit": speed_limit,
-                    "lanes": lanes,
                     "length_miles": segment_length
                 })
                 
@@ -516,11 +350,9 @@ class CombinedZipShapefileAnalyzer:
         """Calculate Level of Traffic Stress"""
         ft = str(facility_type).upper().strip()
         
-        if "PROTECTED" in ft or "SHARED USE PATH" in ft or "SEPARATED" in ft:
+        if "PROTECTED" in ft or "SHARED USE PATH" in ft:
             return 1
         elif "BUFFERED" in ft and speed_limit <= 30:
-            return 2
-        elif ("BIKE LANE" in ft or "CYCLE LANE" in ft) and speed_limit <= 35:
             return 2
         elif "SHARED" in ft and speed_limit <= 35 and lanes <= 2:
             return 3
@@ -573,7 +405,7 @@ def calculate_bike_route_osrm(start_coords: List[float], end_coords: List[float]
         
         # Analyze with shapefile if available
         segments = []
-        overall_score = 70
+        overall_score = 70  # Default score
         facility_stats = {}
         
         if shapefile_analyzer.loaded:
@@ -677,6 +509,7 @@ def get_transit_routes_google(origin: Tuple[float, float], destination: Tuple[fl
         for idx, route_data in enumerate(data.get("routes", [])):
             route = parse_google_transit_route(route_data, idx)
             if route:
+                # Enhance with GTFS data
                 route = enhance_route_with_gtfs(route)
                 routes.append(route)
         
@@ -951,21 +784,14 @@ def analyze_bike_bus_bike_routes(start_point: List[float], end_point: List[float
 
 # Initialize global components
 gtfs_manager = EnhancedGTFSManager()
-shapefile_analyzer = CombinedZipShapefileAnalyzer()
+shapefile_analyzer = ShapefileAnalyzer()
 
 # Load data on startup
 def initialize_data():
     """Initialize GTFS and shapefile data"""
     logger.info("Initializing transit data...")
-    try:
-        gtfs_manager.load_gtfs_data()
-    except Exception as e:
-        logger.error(f"GTFS initialization failed: {e}")
-    
-    try:
-        shapefile_analyzer.load_shapefiles()
-    except Exception as e:
-        logger.error(f"Shapefile initialization failed: {e}")
+    gtfs_manager.load_gtfs_data()
+    shapefile_analyzer.load_shapefiles()
 
 # =============================================================================
 # FASTAPI APPLICATION
@@ -1138,77 +964,15 @@ async def get_system_status():
             "shapefile_analysis": {
                 "available": GEOPANDAS_AVAILABLE,
                 "roads_loaded": shapefile_analyzer.loaded,
-                "roads_count": len(shapefile_analyzer.roads_gdf) if shapefile_analyzer.roads_gdf is not None else 0,
-                "transit_stops_count": len(shapefile_analyzer.transit_stops_gdf) if shapefile_analyzer.transit_stops_gdf is not None else 0
+                "roads_count": len(shapefile_analyzer.roads_gdf) if shapefile_analyzer.roads_gdf is not None else 0
             }
         },
         "configuration": {
             "bike_speed_mph": BIKE_SPEED_MPH,
-            "cors_origins": CORS_ALLOW_ORIGINS,
-            "data_zip_url": DATA_ZIP_URL
+            "cors_origins": CORS_ALLOW_ORIGINS
         },
         "timestamp": datetime.datetime.now().isoformat()
     }
-
-# Upload endpoints for dynamic file management
-try:
-    import aiofiles
-    
-    @app.post("/api/upload-shapefile")
-    async def upload_shapefile(
-        file: UploadFile = File(...),
-        file_type: str = Form(..., description="'roads' or 'transit_stops'")
-    ):
-        """Upload shapefile for analysis"""
-        try:
-            if file_type not in ["roads", "transit_stops"]:
-                raise HTTPException(status_code=400, detail="file_type must be 'roads' or 'transit_stops'")
-            
-            if not file.filename.endswith(('.zip', '.shp')):
-                raise HTTPException(status_code=400, detail="File must be a ZIP or SHP file")
-            
-            # Create upload directory
-            upload_dir = "/data" if os.path.exists("/data") else "./uploaded_data"
-            os.makedirs(upload_dir, exist_ok=True)
-            
-            # Save file
-            file_path = os.path.join(upload_dir, f"{file_type}.zip")
-            
-            async with aiofiles.open(file_path, 'wb') as f:
-                content = await file.read()
-                await f.write(content)
-            
-            logger.info(f"Uploaded {file_type} shapefile: {file_path}")
-            
-            # Reload shapefiles
-            shapefile_analyzer.load_shapefiles()
-            
-            return {
-                "success": True,
-                "message": f"Successfully uploaded {file_type} shapefile",
-                "file_path": file_path,
-                "file_size": len(content),
-                "analyzer_loaded": shapefile_analyzer.loaded
-            }
-            
-        except Exception as e:
-            logger.error(f"Upload error: {e}")
-            raise HTTPException(status_code=500, detail=str(e))
-
-    @app.get("/api/shapefile-status")
-    async def get_shapefile_status():
-        """Get current shapefile loading status"""
-        return {
-            "roads_loaded": shapefile_analyzer.roads_gdf is not None,
-            "transit_stops_loaded": shapefile_analyzer.transit_stops_gdf is not None,
-            "analyzer_ready": shapefile_analyzer.loaded,
-            "roads_count": len(shapefile_analyzer.roads_gdf) if shapefile_analyzer.roads_gdf is not None else 0,
-            "stops_count": len(shapefile_analyzer.transit_stops_gdf) if shapefile_analyzer.transit_stops_gdf is not None else 0,
-            "data_source": DATA_ZIP_URL
-        }
-        
-except ImportError:
-    logger.warning("aiofiles not available - upload endpoints disabled")
 
 def get_html_interface():
     """Return the complete HTML interface"""
@@ -1246,11 +1010,6 @@ def get_html_interface():
             background: linear-gradient(180deg, #f8f9fa 0%, #e9ecef 100%);
             border-left: 1px solid #dee2e6;
         }
-        .status-indicator {
-            background: linear-gradient(135deg, #d4edda, #c3e6cb);
-            color: #155724; padding: 15px; border-radius: 8px;
-            margin-bottom: 20px; text-align: center; font-size: 0.9em;
-        }
         .controls {
             background: white; padding: 20px; border-radius: 10px;
             margin-bottom: 20px; box-shadow: 0 4px 15px rgba(0,0,0,0.1);
@@ -1278,9 +1037,6 @@ def get_html_interface():
             background: linear-gradient(135deg, #bdc3c7, #95a5a6);
             cursor: not-allowed; transform: none; box-shadow: none;
         }
-        .btn-clear {
-            background: linear-gradient(135deg, #e74c3c, #c0392b);
-        }
         .route-card {
             background: white; border-radius: 12px; padding: 25px;
             margin-bottom: 20px; box-shadow: 0 6px 20px rgba(0,0,0,0.1);
@@ -1290,35 +1046,11 @@ def get_html_interface():
             transform: translateY(-2px);
             box-shadow: 0 8px 25px rgba(0,0,0,0.15);
         }
-        .route-card.selected {
-            border-color: #3498db;
-            box-shadow: 0 0 0 3px rgba(52, 152, 219, 0.1);
-        }
         .route-header {
             display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;
         }
         .route-name {
             font-weight: 700; color: #2c3e50; font-size: 1.2em;
-        }
-        .route-type {
-            padding: 6px 12px; border-radius: 15px; font-size: 0.8em; font-weight: 600;
-        }
-        .type-multimodal { background: linear-gradient(135deg, #e74c3c, #f39c12); color: white; }
-        .type-bike { background: linear-gradient(135deg, #27ae60, #2ecc71); color: white; }
-        .type-transit { background: linear-gradient(135deg, #3498db, #5dade2); color: white; }
-        .route-summary {
-            display: grid; grid-template-columns: repeat(auto-fit, minmax(100px, 1fr));
-            gap: 10px; margin-bottom: 15px;
-        }
-        .summary-item {
-            text-align: center; padding: 10px; background: #f8f9fa;
-            border-radius: 6px; border: 1px solid #e9ecef;
-        }
-        .summary-value {
-            font-weight: bold; color: #3498db; font-size: 1.1em; display: block;
-        }
-        .summary-label {
-            font-size: 0.8em; color: #6c757d; text-transform: uppercase; margin-top: 4px;
         }
         .coordinates-display {
             background: #f8f9fa; padding: 15px; border-radius: 8px;
@@ -1329,6 +1061,7 @@ def get_html_interface():
             color: #c62828; padding: 20px; border-radius: 10px;
             margin: 20px 0; border-left: 5px solid #f44336;
         }
+        .hidden { display: none; }
         .spinner {
             border: 4px solid rgba(52, 152, 219, 0.2);
             width: 40px; height: 40px; border-radius: 50%;
@@ -1338,11 +1071,6 @@ def get_html_interface():
         @keyframes spin {
             0% { transform: rotate(0deg); }
             100% { transform: rotate(360deg); }
-        }
-        .instructions {
-            background: linear-gradient(135deg, #fff3cd, #ffeaa7);
-            color: #856404; padding: 20px; border-radius: 10px;
-            margin-bottom: 20px; border-left: 5px solid #f1c40f;
         }
     </style>
 </head>
@@ -1356,32 +1084,18 @@ def get_html_interface():
         <div id="map"></div>
         
         <div id="sidebar">
-            <div class="status-indicator" id="statusIndicator">
-                System Status: Loading...
-            </div>
-            
-            <div class="instructions">
-                <h3>How to Use</h3>
-                <ol>
-                    <li>Click two points on the map</li>
-                    <li>Select routing mode</li>
-                    <li>Click "Find Routes"</li>
-                    <li>Click route cards to view on map</li>
-                </ol>
-            </div>
-            
             <div class="controls">
                 <div class="form-group">
                     <label for="routingMode">Routing Mode:</label>
                     <select id="routingMode">
-                        <option value="bike">Bike Only (OSRM)</option>
-                        <option value="transit">Transit Only (Google)</option>
-                        <option value="multimodal">Bike-Bus-Bike (Combined)</option>
+                        <option value="bike">Bike Only</option>
+                        <option value="transit">Transit Only</option>
+                        <option value="multimodal">Bike-Bus-Bike</option>
                     </select>
                 </div>
                 
                 <button id="findRoutesBtn" disabled>Find Routes</button>
-                <button class="btn-clear" onclick="clearAll()">Clear All</button>
+                <button onclick="clearAll()">Clear All</button>
                 
                 <div class="coordinates-display">
                     <p><strong>Start:</strong> <span id="startCoords">Click map to select</span></p>
@@ -1412,12 +1126,14 @@ def get_html_interface():
             if (!startPoint) {
                 startPoint = latlng;
                 if (startMarker) map.removeLayer(startMarker);
-                startMarker = L.marker(latlng, {
-                    icon: L.icon({
-                        iconUrl: 'data:image/svg+xml;base64,' + btoa('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" fill="red"><circle cx="16" cy="16" r="10"/><text x="16" y="21" text-anchor="middle" fill="white" font-size="14" font-weight="bold">B</text></svg>'),
-                        iconSize: [32, 32], iconAnchor: [16, 16]
-                    })
-                }).addTo(map);
+                startMarker = L.marker(latlng).addTo(map);
+                startMarker.bindTooltip("Start", {permanent: true}).openTooltip();
+                updateCoordinatesDisplay();
+            } else if (!endPoint) {
+                endPoint = latlng;
+                if (endMarker) map.removeLayer(endMarker);
+                endMarker = L.marker(latlng).addTo(map);
+                endMarker.bindTooltip("End", {permanent: true}).openTooltip();
                 updateCoordinatesDisplay();
             } else {
                 clearAll();
@@ -1522,44 +1238,25 @@ def get_html_interface():
         }
         
         function createRouteCard(route, index, mode) {
-            let routeType = 'type-bike';
-            let routeTypeText = 'BIKE';
-            
-            if (mode === 'multimodal') {
-                routeType = route.type === 'bike_bus_bike' ? 'type-multimodal' : 'type-bike';
-                routeTypeText = route.type === 'bike_bus_bike' ? 'MULTIMODAL' : 'DIRECT BIKE';
-            } else if (mode === 'transit') {
-                routeType = 'type-transit';
-                routeTypeText = 'TRANSIT';
-            }
-            
             let html = `<div class="route-card" onclick="visualizeRoute(window.currentRoutes[${index}], '${mode}')">`;
             html += `<div class="route-header">`;
             html += `<div class="route-name">${route.name || `Route ${index + 1}`}</div>`;
-            html += `<div class="route-type ${routeType}">${routeTypeText}</div>`;
             html += `</div>`;
             
             if (mode === 'multimodal') {
                 const summary = route.summary;
-                html += `<div class="route-summary">`;
-                html += `<div class="summary-item"><span class="summary-value">${summary.total_time_formatted}</span><span class="summary-label">Time</span></div>`;
-                html += `<div class="summary-item"><span class="summary-value">${summary.total_distance_miles}</span><span class="summary-label">Miles</span></div>`;
-                html += `<div class="summary-item"><span class="summary-value">${summary.bike_distance_miles}</span><span class="summary-label">Bike Mi</span></div>`;
-                html += `<div class="summary-item"><span class="summary-value">${summary.average_bike_score}</span><span class="summary-label">Safety</span></div>`;
-                html += `<div class="summary-item"><span class="summary-value">${summary.transfers}</span><span class="summary-label">Transfers</span></div>`;
-                html += `</div>`;
+                html += `<p><strong>Total Time:</strong> ${summary.total_time_formatted}</p>`;
+                html += `<p><strong>Distance:</strong> ${summary.total_distance_miles} mi</p>`;
+                html += `<p><strong>Bike Distance:</strong> ${summary.bike_distance_miles} mi</p>`;
+                html += `<p><strong>Bike Score:</strong> ${summary.average_bike_score}</p>`;
             } else if (mode === 'bike') {
-                html += `<div class="route-summary">`;
-                html += `<div class="summary-item"><span class="summary-value">${route.travel_time_formatted}</span><span class="summary-label">Time</span></div>`;
-                html += `<div class="summary-item"><span class="summary-value">${route.length_miles}</span><span class="summary-label">Miles</span></div>`;
-                html += `<div class="summary-item"><span class="summary-value">${route.overall_score}</span><span class="summary-label">Safety</span></div>`;
-                html += `</div>`;
+                html += `<p><strong>Distance:</strong> ${route.length_miles} miles</p>`;
+                html += `<p><strong>Time:</strong> ${route.travel_time_formatted}</p>`;
+                html += `<p><strong>Safety Score:</strong> ${route.overall_score}</p>`;
             } else if (mode === 'transit') {
-                html += `<div class="route-summary">`;
-                html += `<div class="summary-item"><span class="summary-value">${route.duration_text}</span><span class="summary-label">Time</span></div>`;
-                html += `<div class="summary-item"><span class="summary-value">${route.distance_miles}</span><span class="summary-label">Miles</span></div>`;
-                html += `<div class="summary-item"><span class="summary-value">${route.transfers}</span><span class="summary-label">Transfers</span></div>`;
-                html += `</div>`;
+                html += `<p><strong>Duration:</strong> ${route.duration_text}</p>`;
+                html += `<p><strong>Distance:</strong> ${route.distance_miles} miles</p>`;
+                html += `<p><strong>Transfers:</strong> ${route.transfers}</p>`;
             }
             
             html += `</div>`;
@@ -1571,11 +1268,6 @@ def get_html_interface():
             
             routeLayersGroup.clearLayers();
             
-            // Remove selection from all cards
-            document.querySelectorAll('.route-card').forEach(card => {
-                card.classList.remove('selected');
-            });
-            
             if (mode === 'multimodal' && route.legs) {
                 route.legs.forEach((leg, index) => {
                     if (leg.route && leg.route.geometry) {
@@ -1584,39 +1276,14 @@ def get_html_interface():
                             const latLngs = coords.map(coord => L.latLng(coord[1], coord[0]));
                             const color = leg.color || (leg.type === 'bike' ? '#27ae60' : '#3498db');
                             
-                            const line = L.polyline(latLngs, {
+                            L.polyline(latLngs, {
                                 color: color,
                                 weight: 6,
                                 opacity: 0.8
-                            }).addTo(routeLayersGroup);
-                            
-                            line.bindPopup(`${leg.name} (${leg.type})`);
+                            }).addTo(routeLayersGroup).bindPopup(`${leg.name} (${leg.type})`);
                         }
                     }
                 });
-                
-                // Add bus stop markers if available
-                if (route.bus_stops) {
-                    if (route.bus_stops.start_stop) {
-                        const stop = route.bus_stops.start_stop;
-                        L.marker([stop.display_y, stop.display_x], {
-                            icon: L.icon({
-                                iconUrl: 'data:image/svg+xml;base64,' + btoa('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" fill="blue"><rect x="6" y="8" width="20" height="16" rx="2" fill="blue"/><circle cx="12" cy="26" r="2" fill="white"/><circle cx="20" cy="26" r="2" fill="white"/></svg>'),
-                                iconSize: [24, 24], iconAnchor: [12, 12]
-                            })
-                        }).addTo(routeLayersGroup).bindPopup(`Start Transit: ${stop.name}`);
-                    }
-                    
-                    if (route.bus_stops.end_stop) {
-                        const stop = route.bus_stops.end_stop;
-                        L.marker([stop.display_y, stop.display_x], {
-                            icon: L.icon({
-                                iconUrl: 'data:image/svg+xml;base64,' + btoa('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" fill="blue"><rect x="6" y="8" width="20" height="16" rx="2" fill="blue"/><circle cx="12" cy="26" r="2" fill="white"/><circle cx="20" cy="26" r="2" fill="white"/></svg>'),
-                                iconSize: [24, 24], iconAnchor: [12, 12]
-                            })
-                        }).addTo(routeLayersGroup).bindPopup(`End Transit: ${stop.name}`);
-                    }
-                }
             } else if (route.geometry) {
                 const coords = route.geometry.coordinates;
                 if (coords && coords.length > 0) {
@@ -1641,42 +1308,9 @@ def get_html_interface():
             }
         }
         
-        async function checkSystemStatus() {
-            try {
-                const response = await fetch('/api/status');
-                const status = await response.json();
-                
-                const statusEl = document.getElementById('statusIndicator');
-                let statusText = 'System Status: ';
-                
-                if (status.components.google_maps_api && status.components.gtfs_data.loaded) {
-                    statusText += 'All Systems Operational';
-                    statusEl.style.background = 'linear-gradient(135deg, #d4edda, #c3e6cb)';
-                } else if (status.components.google_maps_api || status.components.gtfs_data.loaded) {
-                    statusText += 'Partially Operational';
-                    statusEl.style.background = 'linear-gradient(135deg, #fff3cd, #ffeaa7)';
-                } else {
-                    statusText += 'Limited Functionality';
-                    statusEl.style.background = 'linear-gradient(135deg, #ffebee, #ffcdd2)';
-                }
-                
-                const details = [];
-                if (status.components.google_maps_api) details.push('Google Maps: ✓');
-                if (status.components.gtfs_data.loaded) details.push('GTFS: ✓');
-                if (status.components.shapefile_analysis.roads_loaded) details.push('Shapefiles: ✓');
-                
-                statusEl.innerHTML = statusText + '<br><small>' + details.join(' | ') + '</small>';
-                
-            } catch (error) {
-                console.error('Status check failed:', error);
-                document.getElementById('statusIndicator').innerHTML = 'System Status: Unknown';
-            }
-        }
-        
         // Initialize
         document.addEventListener('DOMContentLoaded', () => {
             initializeMap();
-            checkSystemStatus();
             document.getElementById('findRoutesBtn').addEventListener('click', findRoutes);
         });
     </script>
@@ -1697,10 +1331,9 @@ if __name__ == "__main__":
     print(f"OSRM Server: {OSRM_SERVER}")
     print(f"Google API Key configured: {bool(GOOGLE_API_KEY)}")
     print(f"GeoPandas available: {GEOPANDAS_AVAILABLE}")
-    print(f"Data ZIP URL: {DATA_ZIP_URL}")
     
     uvicorn.run(
-        app,
+        "integrated_multimodal_transit_tool:app",
         host="0.0.0.0",
         port=port,
         reload=False,
