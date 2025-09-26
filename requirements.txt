@@ -9,3 +9,5 @@ pyproj>=3.6
 pyogrio>=0.9
 geopandas>=0.14.4
 python-dotenv>=1.0
+aiofiles==23.2.1
+shapely==2.0.2
