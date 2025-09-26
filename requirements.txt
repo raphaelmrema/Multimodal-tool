@@ -1,8 +1,11 @@
-your-repo/
-├─ integrated_multimodal_transit.py     # your FastAPI app
-├─ requirements.txt
-├─ Procfile
-├─ railway.toml
-├─ .env.example
-├─ README.md
-└─ (optional) public/                    # if you want custom static assets
+fastapi>=0.115
+uvicorn[standard]>=0.30
+requests>=2.32
+polyline>=2.0
+pandas>=2.2
+numpy>=1.26
+shapely>=2.0
+pyproj>=3.6
+pyogrio>=0.9
+geopandas>=0.14.4
+python-dotenv>=1.0
